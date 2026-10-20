@@ -32,13 +32,13 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import xmxdb
+import xmxderive
 
 PROTOCOL_VERSION = "2025-06-18"
 KNOWN_VERSIONS = {"2024-11-05", "2025-03-26", "2025-06-18"}
 
 CFG = {"daemon": "http://127.0.0.1:9143", "db": "./xmxmon.db",
-       "captures": "./captures", "logs": None, "shoulder_s": 2.0,
-       "dump_rows": 5000}
+       "captures": "./captures", "logs": None, "shoulder_s": 2.0}
 JOBS = {}          # job_id -> {state, ...}; in-memory by design
 _JOBS_LOCK = threading.Lock()
 _NAME_OK = re.compile(r"[^A-Za-z0-9_.-]")
@@ -173,15 +173,6 @@ def _job_run(job):
             job["run_id"] = res[0] if res else next(
                 (r["run_id"] for r in xmxdb.list_runs(con)
                  if r["name"] == name), None)
-            # The result object is the deliverable: full per-metric summary
-            # AND the row-level dump. Selection happens in the agent, never
-            # here. dump_rows is the only transport guard (very long jobs),
-            # operator-level, and it announces itself via `truncated`.
-            summary = dump = None
-            if job["run_id"]:
-                summary = xmxdb.summarize_run(con, job["run_id"])
-                dump = xmxdb.dump_run(con, job["run_id"],
-                                      max_rows=CFG["dump_rows"])
         finally:
             con.close()
 
@@ -204,7 +195,10 @@ def _job_run(job):
             "logs_note": job.get("logs_note"),
             "group": job.get("group"),
             "group_restored": job.get("group_restored"),
-            "run_id": job["run_id"], "summary": summary, "dump": dump}
+            "run_id": job["run_id"]}
+        # Lean on purpose: the outcome, the logs, the run_id — nothing else.
+        # Full summaries/dumps blew smaller context windows; the data is one
+        # query away (db_schema, then query_sql / dump_run / summarize_run).
         job["state"] = "done"
     except Exception as e:
         log(f"job {jid} failed: {e!r}")
@@ -240,7 +234,7 @@ def tool_run_profile(a):
     return {"job_id": jid, "state": "running"}
 
 
-def tool_run_result(a):
+def tool_job_status(a):
     with _JOBS_LOCK:
         job = JOBS.get(a.get("job_id"))
     if not job:
@@ -262,6 +256,37 @@ def tool_run_result(a):
 
 
 # -- tool dispatch -----------------------------------------------------------
+
+def tool_db_schema(a):
+    con = xmxdb.connect(CFG["db"])
+    try:
+        tables = []
+        for g in con.execute("SELECT metric_group, table_name FROM groups"):
+            group = g["metric_group"]
+            cols = [{"name": c,
+                     "kind": "level" if xmxderive.is_percent(c)
+                             else "counter"}
+                    for c in xmxdb.metric_columns(con, group)]
+            n = con.execute(
+                f"SELECT COUNT(*) c FROM {g['table_name']}").fetchone()["c"]
+            tables.append({"table": g["table_name"], "view":
+                           "v_" + g["table_name"], "metric_group": group,
+                           "rows": n, "metrics": cols})
+        n_runs = con.execute("SELECT COUNT(*) c FROM runs").fetchone()["c"]
+        return {"runs": n_runs,
+                "spine": "runs(run_id, name, device, metric_group,"
+                         " period_ms, started_ts, ended_ts, rows, path)",
+                "framing": "every samples table carries: run_id, seq,"
+                           " t, gpu_ns, gpu_core_clocks, avg_core_mhz,"
+                           " core_mhz, extra(JSON); v_ views add name and"
+                           " wall_ts (unix epoch)",
+                "semantics": "levels are per-window gauges; average them."
+                             " counters are per-window counts; per-second"
+                             " rate = SUM(x)*1e9/SUM(gpu_ns)",
+                "tables": tables}
+    finally:
+        con.close()
+
 
 def tool_query_sql(a):
     sql = a.get("sql", "")
@@ -370,8 +395,9 @@ TOOLS = {
         " group afterwards. The switch is DEVICE-WIDE while the job runs."
         " A capture with short idle shoulders is started and stopped"
         " automatically — invisible to the caller. The job is UNBOUNDED:"
-        " returns immediately with a receipt; fetch the result with"
-        " run_result once finished. Counters are device-wide: anything else"
+        " returns immediately with a receipt; fetch the outcome with"
+        " job_status, then explore the run with db_schema + query_sql."
+        " Counters are device-wide: anything else"
         " on the GPU during the run is summed in; the idle shoulders make"
         " contamination visible. (For docker: pass env as -e flags in argv,"
         " the env arg only reaches the docker CLI.)",
@@ -382,17 +408,25 @@ TOOLS = {
                              "group": _str}, ["argv"]),
         "handler": tool_run_profile,
     },
-    "run_result": {
-        "description": "Fetch the result of a run_profile job. When done:"
-        " exit_code, wall_s, log paths and tails, run_id, the full"
-        " per-metric summary (every metric the group reports: levels"
-        " averaged, counters as per-second rates over gpu_ns, derived"
-        " ratios) and the complete row-level dump (all reports, all fields;"
-        " `truncated` only if it exceeded the operator's dump_rows guard —"
-        " page the rest via dump_run). While running: state, elapsed time,"
-        " live row count.",
+    "job_status": {
+        "description": "Fetch the outcome of a run_profile job. Small by"
+        " design. When done: exit_code, wall_s, log paths and tails,"
+        " group/group_restored (if requested), and run_id — the handle into"
+        " the store. Explore the run's DATA with db_schema + query_sql"
+        " (or dump_run / summarize_run), not here. While running: state,"
+        " elapsed time, live row count. Error: state + reason.",
         "inputSchema": _obj({"job_id": _str}, ["job_id"]),
-        "handler": tool_run_result,
+        "handler": tool_job_status,
+    },
+    "db_schema": {
+        "description": "The queryable surface, self-described: every"
+        " samples_<Group> table with its metric columns annotated level"
+        " (average them) or counter (per-second rate ="
+        " SUM(x)*1e9/SUM(gpu_ns)), row counts, the runs spine, and the"
+        " shared framing columns. Call this before writing query_sql so you"
+        " select only the columns that exist for the run's group.",
+        "inputSchema": _obj({}),
+        "handler": None,  # custom: needs connection
     },
 }
 
@@ -410,6 +444,8 @@ def _call(name, a):
             if i < n - 1:
                 time.sleep(iv)
         return {"snapshots": out}
+    if name == "db_schema":
+        return tool_db_schema(a)
     if name == "list_runs":
         ing = xmxdb.ingest_dir(CFG["db"], CFG["captures"])
         con = xmxdb.connect(CFG["db"])
@@ -460,7 +496,7 @@ def handle(msg):
         _send({"jsonrpc": "2.0", "id": rid, "result": {
             "protocolVersion": v if v in KNOWN_VERSIONS else PROTOCOL_VERSION,
             "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": "xmxmon-mcp", "version": "0.2.0"}}})
+            "serverInfo": {"name": "xmxmon-mcp", "version": "0.3.0"}}})
     elif method == "ping":
         _send({"jsonrpc": "2.0", "id": rid, "result": {}})
     elif method and method.startswith("notifications/"):
@@ -497,17 +533,12 @@ def main():
                     help="directory for run_profile stdout/stderr logs"
                          " (default: the captures dir; output is discarded"
                          " if not writable — never jobs)")
-    ap.add_argument("--dump-rows", type=int, default=CFG["dump_rows"],
-                    help="max rows embedded in run_result's dump"
-                         " (operator-level transport guard; exceeded runs"
-                         " announce truncated:true and page via dump_run)")
     ap.add_argument("--shoulder-s", type=float, default=CFG["shoulder_s"],
                     help="idle baseline around run_profile workloads"
                          " (operator-level, never model-facing)")
     args = ap.parse_args()
     CFG.update(daemon=args.daemon, db=args.db, captures=args.captures,
-               logs=args.logs, shoulder_s=args.shoulder_s,
-               dump_rows=args.dump_rows)
+               logs=args.logs, shoulder_s=args.shoulder_s)
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
     log(f"daemon={CFG['daemon']} db={CFG['db']} captures={CFG['captures']}")
