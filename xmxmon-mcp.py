@@ -198,7 +198,7 @@ def _job_run(job):
             "run_id": job["run_id"]}
         # Lean on purpose: the outcome, the logs, the run_id — nothing else.
         # Full summaries/dumps blew smaller context windows; the data is one
-        # query away (db_schema, then query_sql / dump_run / summarize_run).
+        # query away (db_schema, then query_sql).
         job["state"] = "done"
     except Exception as e:
         log(f"job {jid} failed: {e!r}")
@@ -343,36 +343,6 @@ TOOLS = {
                             ["device"]),
         "handler": None,  # custom: loops
     },
-    "list_runs": {
-        "description": "List captured runs in the store (refreshes from the"
-        " captures directory first). Each run: name, device, metric_group,"
-        " wall-clock start/end, row count.",
-        "inputSchema": _obj({}),
-        "handler": None,  # custom: ingest scan then list
-    },
-    "dump_run": {
-        "description": "Dump rows of a run: every metric per hardware report"
-        " (columns carry hardware names; levels are per-window percentages,"
-        " counters are per-window counts — divide by gpu_ns for rates)."
-        " t0/t1 filter by wall-clock (unix epoch). Default returns the whole"
-        " run; runs are small (~50 rows per 20 s at the default period).",
-        "inputSchema": _obj({"run_id": _int, "t0": _num, "t1": _num,
-                             "metrics": {"type": "array",
-                                         "items": {"type": "string"}},
-                             "max_rows": _int}, ["run_id"]),
-        "handler": None,  # custom: needs connection
-    },
-    "summarize_run": {
-        "description": "Aggregates for a run: levels averaged (min/max),"
-        " counters as per-second rates over SUM(gpu_ns), plus derived"
-        " metrics via the same derivation the daemon uses. Numbers only."
-        " Interpretation caveats: XMX reads zero for token-by-token decode"
-        " (matrix-shaped batch/prefill only); XMX_INT2 needs BOTH operands"
-        " at 2-bit (mixed precision buckets under the wider type).",
-        "inputSchema": _obj({"run_id": _int, "t0": _num, "t1": _num},
-                            ["run_id"]),
-        "handler": None,
-    },
     "query_sql": {
         "description": "Read-only SQL over the run store. Tables: runs"
         " (capture spine), groups (metric group registry), and one"
@@ -385,7 +355,7 @@ TOOLS = {
         "handler": tool_query_sql,
     },
     "run_profile": {
-        "description": "Execute a program while profiling the whole device."
+        "description": "Execute a program to profiles its selected group."
         " argv is an array (program + args); env merges over the server's"
         " environment (SYCL selectors such as ONEAPI_DEVICE_SELECTOR go"
         " here). Optional group: the metric group to sample under (e.g."
@@ -412,19 +382,14 @@ TOOLS = {
         "description": "Fetch the outcome of a run_profile job. Small by"
         " design. When done: exit_code, wall_s, log paths and tails,"
         " group/group_restored (if requested), and run_id — the handle into"
-        " the store. Explore the run's DATA with db_schema + query_sql"
-        " (or dump_run / summarize_run), not here. While running: state,"
-        " elapsed time, live row count. Error: state + reason.",
+        " the store. Explore the run's DATA with db_schema + query_sql,"
+        " not here. While running: state, elapsed time, live row count."
+        " Error: state + reason.",
         "inputSchema": _obj({"job_id": _str}, ["job_id"]),
         "handler": tool_job_status,
     },
     "db_schema": {
-        "description": "The queryable surface, self-described: every"
-        " samples_<Group> table with its metric columns annotated level"
-        " (average them) or counter (per-second rate ="
-        " SUM(x)*1e9/SUM(gpu_ns)), row counts, the runs spine, and the"
-        " shared framing columns. Call this before writing query_sql so you"
-        " select only the columns that exist for the run's group.",
+        "description": "Get the database schema so you can use the query_sql tool",
         "inputSchema": _obj({}),
         "handler": None,  # custom: needs connection
     },
@@ -446,23 +411,6 @@ def _call(name, a):
         return {"snapshots": out}
     if name == "db_schema":
         return tool_db_schema(a)
-    if name == "list_runs":
-        ing = xmxdb.ingest_dir(CFG["db"], CFG["captures"])
-        con = xmxdb.connect(CFG["db"])
-        try:
-            return {"runs": xmxdb.list_runs(con),
-                    "ingested": [{"name": n, "run_id": r} for n, r in ing]}
-        finally:
-            con.close()
-    if name in ("dump_run", "summarize_run"):
-        con = xmxdb.connect(CFG["db"])
-        try:
-            fn = getattr(xmxdb, name)
-            kw = {k: a[k] for k in ("t0", "t1", "metrics", "max_rows")
-                  if k in a}
-            return fn(con, a["run_id"], **kw)
-        finally:
-            con.close()
     return TOOLS[name]["handler"](a)
 
 

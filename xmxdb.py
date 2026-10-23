@@ -15,9 +15,8 @@ derived — wall clock, per-second rates — comes from the per-group v_samples_
 views or the helpers below, never from duplicated columns.
 
 Importable on purpose (underscore name, like xmxderive.py): the xmx-ingest
-CLI and the MCP server both consume this. xmxderive provides the percent-vs-
-counter semantics and the derived-metric math so offline numbers agree with
-the live daemon.
+CLI and the MCP server both consume this. xmxderive identifies a capture's
+metric group; all analysis is left to SQL over the per-group views.
 """
 import json
 import os
@@ -219,90 +218,3 @@ def list_runs(con):
         " rows, path FROM runs ORDER BY started_ts DESC")]
 
 
-def _range(t0, t1, params):
-    sql = ""
-    if t0 is not None:
-        sql += " AND wall_ts >= ?"
-        params.append(t0)
-    if t1 is not None:
-        sql += " AND wall_ts <= ?"
-        params.append(t1)
-    return sql
-
-
-def _run_meta(con, run_id):
-    run = con.execute("SELECT * FROM runs WHERE run_id=?",
-                      (run_id,)).fetchone()
-    if not run:
-        raise KeyError(f"no run {run_id}")
-    return dict(run)
-
-
-def dump_run(con, run_id, t0=None, t1=None, metrics=None, max_rows=2000):
-    """Wide rows for a run, optionally wall-time-ranged and column-projected."""
-    run = _run_meta(con, run_id)
-    cols = metric_columns(con, run["metric_group"])
-    if metrics is not None:
-        bad = [m for m in metrics if m not in cols]
-        if bad:
-            raise KeyError(f"metrics not in {run['metric_group']}: {bad}")
-        cols = list(metrics)
-    sel = ", ".join(f'"{c}"' for c in
-                    ["seq", "wall_ts", "t", "gpu_ns", "avg_core_mhz"] + cols)
-    params = [run_id]
-    sql = (f"SELECT {sel} FROM v_{table_for(run['metric_group'])}"
-           f" WHERE run_id=?" + _range(t0, t1, params)
-           + f" ORDER BY seq LIMIT {max_rows + 1}")
-    rows = [list(r) for r in con.execute(sql, params)]
-    truncated = len(rows) > max_rows
-    return {"run": run,
-            "columns": ["seq", "wall_ts", "t", "gpu_ns", "avg_core_mhz"]
-                       + cols,
-            "rows": rows[:max_rows], "truncated": truncated}
-
-
-def summarize_run(con, run_id, t0=None, t1=None):
-    """Aggregates with xmxderive semantics: levels are averaged, counters are
-    summed over SUM(gpu_ns) for per-second rates; derived metrics come from
-    the same xmxderive.derive the daemon uses, so offline and live agree."""
-    run = _run_meta(con, run_id)
-    group = run["metric_group"]
-    cols = metric_columns(con, group)
-    params = [run_id]
-    rng = _range(t0, t1, params)
-    agg = ", ".join(f'AVG("{c}"), MIN("{c}"), MAX("{c}"), SUM("{c}")'
-                    for c in cols)
-    row = tuple(con.execute(
-        f"SELECT COUNT(*), SUM(gpu_ns), AVG(avg_core_mhz), {agg}"
-        f" FROM v_{table_for(group)} WHERE run_id=?" + rng,
-        params).fetchone())
-    n, gpu_ns_total, mhz_avg = row[0], row[1], row[2]
-
-    metrics, v = {}, {}
-    for i, c in enumerate(cols):
-        avg, mn, mx, tot = row[3 + i * 4: 7 + i * 4]
-        if avg is None:
-            continue  # reported by the group but absent in this range
-        if xmxderive.is_percent(c):
-            metrics[c] = {"kind": "level", "avg": avg, "min": mn, "max": mx}
-            v[c] = avg
-        else:
-            rate = tot * 1e9 / gpu_ns_total if gpu_ns_total else None
-            metrics[c] = {"kind": "counter", "total": tot,
-                          "rate_per_s": rate, "max_per_window": mx}
-            if rate is not None:
-                v[c] = rate
-    derived = [{"label": lbl,
-                "value": (None if val != val or val in (float("inf"),
-                                                         float("-inf"))
-                          else val),
-                "unit": unit, "note": note}
-               for lbl, val, unit, note in xmxderive.derive(v, group)]
-    wall = con.execute(
-        f"SELECT MIN(wall_ts), MAX(wall_ts) FROM v_{table_for(group)}"
-        f" WHERE run_id=?" + rng, params).fetchone()
-    return {"run": {**run, "rows_in_range": n,
-                    "gpu_s": (gpu_ns_total or 0) / 1e9,
-                    "wall_s": ((wall[1] - wall[0]) if n > 1 else 0.0),
-                    "avg_core_mhz": mhz_avg},
-            "metrics": metrics, "derived": derived}
